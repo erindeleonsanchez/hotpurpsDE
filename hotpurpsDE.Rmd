@@ -15,14 +15,14 @@ library(tidyverse)
 library(limma)
 library(arrayQualityMetrics) 
 library(ape) # for pcoa
-library(vegan) #vegdist
+library(vegan) 
 library(statmod)
 library(reshape2)
 library(Rmisc)
 library(Matrix)
 ```
 
-# Combining featureCounts .txt files downloaded from hotpurps repo commit on Jan 22, 2023
+# Combining featureCounts .txt files downloaded from hotpurps repo commit (featureCounts_gene_id_pairs) on Jan 22, 2023
 
 ```{r}
 myfiles=list.files(path = "counts", pattern = "*.txt" )  #read in list of featureCounts .txt files
@@ -220,6 +220,7 @@ colnames(design_multi_gc)[4] <- "MatW_DevW"
 # Filter and normalize count matrix input
 gene_counts_matrix <- as.matrix(data_input_gc)
 
+# create a new DGE list with counts from matrix just created
 DGEList <- DGEList(counts = gene_counts_matrix, 
                    group = targets_gc$grouping, 
                    remove.zeros = T)
