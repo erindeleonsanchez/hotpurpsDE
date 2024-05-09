@@ -1,0 +1,389 @@
+---
+title: "hotpurps_DE"
+author: "Erin de Leon Sanchez"
+date: "5/7/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(root.dir = '~/Documents/GitHub/hotpurpsDE/')
+
+library(dplyr)
+library(edgeR)
+library(DESeq2)
+library(tidyverse)
+library(limma)
+library(arrayQualityMetrics) 
+library(ape) # for pcoa
+library(vegan) #vegdist
+library(statmod)
+library(reshape2)
+library(Rmisc)
+library(Matrix)
+```
+
+# Combining featureCounts .txt files downloaded from hotpurps repo commit on Jan 22, 2023
+
+```{r}
+myfiles=list.files(path = "counts", pattern = "*.txt" )  #read in list of featureCounts .txt files
+x <- readDGE(myfiles, path = "counts", skip=1, columns=c(1,7)) # need skip=1
+counts=as.data.frame(x$counts) 
+
+# Shortening column names
+
+colnames(counts)<-substr(colnames(counts), 1,5)
+
+colnames(counts)<-gsub(colnames(counts), pattern = "_s", replacement = "")
+
+# saving combined counts file as .txt 
+#write.table(counts, file = "combined_counts.txt", sep="\t")
+#write.csv(counts, "combined_counts.csv")
+
+# counts$gene_id<-row.names(counts) this added a column called gene_id but don't need this
+
+# Plot distribution of unfiltered read counts across all samples 
+ggplot(data = data.frame(rowMeans(counts)),
+       aes(x = rowMeans.counts.)) +
+  geom_histogram(fill = "grey") +
+  xlim(0, 500) +
+  theme_classic() +
+  labs(title = "Distribution of unfiltered reads") +
+  labs(y = "Density", x = "Raw read counts",
+  title = "Read count distribution: untransformed, unnormalized, unfiltered")
+```
+
+#Tests of differential expression 
+```{r}
+# Create maternal treatment variable - this basically "extracts" that the first letter of the treatment which is the maternal treatment
+Mat = as.vector(sapply(colnames(counts), 
+                       function(col) substr(col, 1, 1))) 
+
+# Create developmental treatment variable - this basically "extracts" that the second letter of the treatment which is the developmental treatment
+Dev = as.vector(sapply(colnames(counts),
+                       function(col) substr(col, 2, 2)))
+
+Rep = as.vector(sapply(colnames(counts),
+                      function(col) substr(col, 3,3)))
+
+# Create df of predictor variables
+targets_gc <- data.frame(Mat = Mat,
+                         Dev = Dev, 
+                         Rep = Rep)
+
+targets_gc$grouping <- paste0(targets_gc$Mat, 
+                             targets_gc$Dev,
+                             sep="") # the grouping column groups by bucket 
+
+# Round counts (if necessary) for use in edgeR
+data_input_gc <- sapply(counts,as.numeric)
+
+row.names(data_input_gc) <- row.names(counts)
+
+data_input_gc <- as.data.frame(round(data_input_gc))
+
+```
+
+# Making DGEList and MDS plot
+```{r}
+# Make DGElist
+
+DGEList <- DGEList(counts = data_input_gc, 
+                   group = targets_gc$grouping, 
+                  remove.zeros = T) 
+#Removing 5302 rows with all zero counts
+
+# Let's remove genes with less then 0.5 cpm (this is ~10 counts in the count file) in no fewer than 8 samples --> 75% of our samples. 
+DGEList_keep <- rowSums(cpm(DGEList) > 0.5) >= 8
+
+# How many genes are removed by read count filter?
+table(DGEList_keep)
+#DGEList_keep
+#FALSE  TRUE 
+#10456 17224 
+
+# Filter and set keep.lib.sizes = F to have R recalculate library sizes after filtering
+DGEList <- DGEList[DGEList_keep, 
+                   keep.lib.sizes = FALSE]
+
+# Create library size normalization factors
+DGEList <- calcNormFactors(DGEList)
+
+
+# CPM conversion and log^2 transformation of read counts
+DGEList_log <- cpm(DGEList,
+                   log = TRUE, 
+                   prior.count = 2)
+
+ggplot(data = data.frame(rowMeans(DGEList_log)), 
+       aes(x = rowMeans.DGEList_log.) ) +
+  geom_histogram(fill = "grey") +
+  theme_classic() +
+  labs(y = "Density", x = "Filtered read counts (logCPM)",
+       title = "Distribution of normalized, filtered read counts")
+
+# MDS of normalized gene read counts
+MDS <- plotMDS(DGEList_log)
+
+# Print MDS plot
+MDS
+```
+
+
+# PCA Plot
+```{r}
+#PCA
+
+# Export pcoa loadings
+dds.pcoa = pcoa(vegdist(t(DGEList_log),
+                          method = "euclidean") / 1000)
+
+# Create df of MDS vector loading
+scores <- dds.pcoa$vectors
+
+## Plot pcoa loadings of each sample, groouped by time point and pCO2 treatment
+
+# Calculate % variation explained by each eigenvector
+percent <- dds.pcoa$values$Eigenvalues
+cumulative_percent_variance <- (percent / sum( percent)) * 100
+
+# Prepare information for pcoa plot, then plot
+color <- c("steelblue1", "tomato1", "goldenrod1")
+par(mfrow = c(1, 1))
+plot(
+  scores[, 1],
+  scores[, 2],
+  cex = .5,
+  cex.axis = 1,
+  cex.lab = 1.25,
+  xlab = paste("PC1, ", round(cumulative_percent_variance[1], 2), "%"),
+  ylab = paste("PC2, ", round(cumulative_percent_variance[2], 2), "%")
+  )
+
+# Add visual groupings to pcoa plot
+ordihull(
+  scores,
+  as.factor(targets_gc$grouping),
+  border = NULL,
+  lty = 2,
+  lwd = .5,
+  label = F,
+  col = color,
+  draw = "polygon",
+  alpha = 100,
+  cex = .5
+  )
+
+ordispider(scores, as.factor(targets_gc$grouping), # can choose how they're grouped
+           label = T, col = color, )
+
+ordilabel(scores, cex = 0.5) # Label sample IDs
+
+```
+
+#Outlier detection
+```{r}
+# Create DESeq2 object required for arrayqualitymetrics
+counts_df <- as.data.frame(DGEList)
+
+
+dds <- DESeqDataSetFromMatrix(counts_df,
+                              colData = targets_gc,
+                              design = formula(~ 1 + Mat + Dev))
+
+# Filter DESeq object
+dds_keep <- rowSums(cpm(dds) > 0.5) >= 8
+dds <- dds[dds_keep]
+
+# Outlier tests
+
+vsd <- varianceStabilizingTransformation(dds, blind=TRUE)
+#every gene contains at least one zero
+
+e <- ExpressionSet(assay(vsd), AnnotatedDataFrame(as.data.frame(colData(vsd))))
+
+arrayQualityMetrics(e, intgroup=c("Mat","Dev"), force=T)
+# No outliers
+```
+
+```{r}
+# Export DGEList_keep
+save(DGEList_keep,
+     file = "DGEList_keep.Rdata")
+
+```
+
+```{r}
+# Create model design that includes maternal and developmental effects and set intercept to 0
+design_multi_gc <- model.matrix(~0 + Mat + Dev + Mat:Dev) 
+colnames(design_multi_gc)[4] <- "MatW_DevW"
+
+# Filter and normalize count matrix input
+gene_counts_matrix <- as.matrix(data_input_gc)
+
+DGEList <- DGEList(counts = gene_counts_matrix, 
+                   group = targets_gc$grouping, 
+                   remove.zeros = T)
+
+DGEList <- DGEList[DGEList_keep, 
+                   keep.lib.sizes = FALSE]
+
+DGEList <- calcNormFactors(DGEList)
+
+# Estmate mean dispersal for use in plotting common dispersal against tagwise dispersal
+DGEList <- estimateGLMCommonDisp(DGEList, 
+                                 design_multi_gc)
+
+# Estmate robust, Bayesian dispersal per gene for estimating regression parameters for glmQL and differential expression
+DGEList <- estimateGLMRobustDisp(DGEList, 
+                                 design_multi_gc) 
+
+# Plot tagwise dispersal and impose w/mean dispersal and trendline
+# the BCV plot visualizes the dispersion parameter fitted to individual genes (black dots with an associated mean expression level and maximum likelihood estimation (MLE) of the dispersion), fitted across gene expression level (blue trendline), and averaged across the entire transcriptome (red horizontal line)
+plotBCV(DGEList) 
+
+# Fit a robust, multifactorial quasi-likelihood glm to normalized read counts
+# this function detects the gene-specific variability above and below the overall level
+fit_gc <- glmQLFit(DGEList, 
+                   design_multi_gc, 
+                   robust = TRUE)
+
+# Plot shrinkage of Bayesian quasi-likelihood dispersion to visualize statistical power of DE analysis
+# this is a plot of the genewise QL dispersion against the gene abundance
+plotQLDisp(fit_gc) # High shrinkage / high statistical power across DE tests
+```
+
+
+# Pairwise comparison of parental differential expression
+```{r}
+# Design contrast between samples based on maternal effect
+# The makeContrast function creates the contrast of (-1, 1) which subtracts the first parameter estimate (mean expression of cold moms) from the second parameter estimate (mean expression of warm moms).
+con_Mom <- makeContrasts(con_Mat_cons = MatC - MatW,
+                            levels = design_multi_gc)
+
+# Apply quasi-likelihood F test to incorporate Bayesian tagwise dispersion estimates as parameter for DEG analysis
+maternal_QLFT <- glmQLFTest(fit_gc, 
+                            contrast = con_Mom)
+
+# Plot maternal logFC across logCPM (fdr < 0.05)
+#Here, we're visualizing the difference in log-fold-change of gene expression between cold moms and warm moms
+plotMD(maternal_QLFT)
+
+# How many significant DEGs? 2405
+summary(decideTestsDGE(maternal_QLFT, 
+                       adjust.method = "fdr",
+                       p.value = 0.05))
+
+#  1*MatC -1*MatW
+# Down              238
+# NotSig          16814
+# Up                172
+
+# Filter for significance and logFC cutoff (doubling of fold change or logFC of 1)
+maternal_QLFT_cutoff <- topTags(maternal_QLFT, 
+                                n = (238 + 172), # these #s are the # of up & down regulated genes
+                                adjust.method = "fdr",
+                                p.value = 0.05)
+
+# Create df of logFC and sign cutoff DEGs
+maternal_QLFT_cutoff_df <- data.frame(maternal_QLFT_cutoff$table)
+maternal_QLFT_fc_cutoff_df <- maternal_QLFT_cutoff_df[!(abs( maternal_QLFT_cutoff_df$logFC) < 1),]
+
+# Count total DEGs with logFC cutoff
+nrow(maternal_QLFT_cutoff_df) # Without logFC cutoff = 410 DEGs 
+nrow(maternal_QLFT_fc_cutoff_df) # With logFC cutoff = 175 DEGs
+
+```
+
+
+# Pairwise comparison of developmental differential expression
+```{r}
+# Design contrast between samples based on developmental effect
+con_Dev <- makeContrasts(con_Dev_cons = DevW, 
+                         levels = design_multi_gc)
+
+# Apply quasi-likelihood F test to incorporate Bayesian tagwise dispersion estimates as parameter for DEG analysis
+dev_QLFT <- glmQLFTest(fit_gc,
+                       contrast = con_Dev)
+
+# Plot dev logFC across logCPM (fdr < 0.05) Here, we're visualizing the difference in log-fold-change of gene expression between larvae from cold developmental conditions and warm developmental conds
+plotMD(dev_QLFT)
+
+# How many significant DEGs? 
+summary( decideTestsDGE( dev_QLFT, 
+                         adjust.method = "fdr",
+                         p.value = 0.05 ) )
+#       1*DevW
+# Down      358
+# NotSig  16233
+# Up        633
+
+# Filter for significance and logFC cutoff
+dev_QLFT_cutoff <- topTags(dev_QLFT, 
+                                n = (358 + 633), 
+                                adjust.method = "fdr",
+                                p.value = 0.05)
+
+# Create df of logFC and sig cutoff DEGs (doubling of fold change or logFC of 1)
+dev_QLFT_cutoff_df <- data.frame( dev_QLFT_cutoff$table )
+dev_QLFT_fc_cutoff_df <- dev_QLFT_cutoff_df[ !( abs( dev_QLFT_cutoff_df$logFC ) < 1 ), ]
+
+# Count total DEGs with logFC cutoff
+nrow(dev_QLFT_cutoff_df) # Without logFC cutoff = 991 DEGs
+nrow(dev_QLFT_fc_cutoff_df) # With logFC cutoff = 452 DEGs
+
+## Make MD plot
+# Create plotting df
+dev_QLFT$table$Effect <- "Developmental"
+maternal_QLFT$table$Effect <- "Transgenerational"
+
+dev_QLFT$table$FDR <- p.adjust(dev_QLFT$table$PValue, method = "fdr")
+maternal_QLFT$table$FDR <- p.adjust(maternal_QLFT$table$PValue, method = "fdr")
+
+QLFT <- rbind(dev_QLFT$table, maternal_QLFT$table)
+QLFT$Dir <- ifelse(QLFT$logFC > 0 & QLFT$FDR < 0.05, "Up", 
+                             ifelse(QLFT$logFC < 0 & QLFT$FDR < 0.05,
+                                    "Down", "None"))
+
+QLFT$Effect = factor(
+  QLFT$Effect,
+  levels=c('Transgenerational','Developmental'))
+
+QLFT$Dir = factor(
+  QLFT$Dir,
+  levels=c('Down','Up', 'None'))
+
+# Plot Fig 1, which will be LogFCs of differential expression plotted against baseline transcript abundance. Significant upregulation in red and downregulation in blue
+
+Fig1 <- ggplot(data = QLFT,
+                aes(x = logCPM, y = logFC, size = Dir, color = Dir)) +
+  geom_point() +
+  scale_size_manual(values = c(1, 1, .1), guide = "none") +
+  scale_color_manual(values = c("blue", "red", "black"), guide = "none") +
+  facet_grid(Effect~.) +
+  theme_classic(base_rect_size = 0, base_size = 20)
+
+Fig1
+
+```
+
+# Interactive effects
+```{r}
+con_int <- makeContrasts(int_cons = MatW_DevW, 
+                         levels = design_multi_gc)
+
+# Apply quasi-likelihood F test to incorporate Bayesian tagwise dispersion estimates as parameter for DEG analysis
+int_QLFT <- glmQLFTest(fit_gc,
+                       contrast = con_int)
+
+# Plot dev logFC across logCPM (fdr < 0.05)
+plotMD(int_QLFT)
+
+# How many significant DEGs? 
+summary(decideTestsDGE(int_QLFT, 
+                         adjust.method = "fdr",
+                         p.value = 0.05))
+#       1*MatW_DevW
+# Down     0
+# NotSig  17224
+# Up       0
+```
